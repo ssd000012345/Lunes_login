@@ -32,125 +32,122 @@ async function humanType(locator, text) {
 }
 
 /**
- * 等待页面级 Cloudflare 拦截通过（整页跳转型）
+ * 改进：处理页面级 Cloudflare 拦截（无 iframe 的 JS 挑战）
+ * 等待 URL 改变或登录表单出现
  */
-async function waitForCloudflarePass(page, timeoutMs = 25_000) {
-  const deadline = Date.now() + timeoutMs;
-  console.log('[CF] 等待 Cloudflare 页面验证通过...');
-  while (Date.now() < deadline) {
-    const cfFrames = page.frames().filter(f => f.url().includes('challenges.cloudflare'));
-    if (cfFrames.length === 0) {
-      console.log('[CF] ✅ Cloudflare 页面拦截已放行');
-      return true;
-    }
-    await sleep(800);
-  }
-  console.warn('[CF] ⚠️  等待超时，继续尝试...');
-  return false;
+async function waitForChallengePass(page, timeoutMs = 30000) {
+  const initialUrl = page.url();
+  console.log('[CF] 检测可能存在的页面级 Cloudflare 挑战...');
+
+  await page.waitForFunction(
+    ({ initialUrl }) => {
+      const urlChanged = window.location.href !== initialUrl;
+      const hasLoginForm = !!document.querySelector('input[type="email"], input[name="email"]');
+      return urlChanged || hasLoginForm;
+    },
+    { timeout: timeoutMs, polling: 1000 },
+    { initialUrl }
+  );
+
+  await page.waitForLoadState('networkidle');
+  await sleep(2000);
+  console.log('[CF] 挑战处理完成，当前 URL:', page.url());
 }
 
 /**
- * 处理表单内嵌的 Cloudflare Turnstile
- *
- * 核心思路：
- * - Turnstile 的 checkbox 在 Shadow DOM / iframe 内，不能直接 .click()
- * - 用 page.mouse 模拟真实鼠标点击 iframe 的 checkbox 区域
- * - 通过检测 iframe 内 #success div 的 display 样式判断是否通过
+ * 改进的表单内嵌 Turnstile 处理：
+ * 1. 使用 frameLocator 精确定位 iframe
+ * 2. 直接寻找复选框并点击（支持坐标点击或 evaluate 点击）
+ * 3. 等待验证 token 生成作为成功标志
  */
-async function handleEmbeddedTurnstile(page, timeoutMs = 35_000) {
+async function handleEmbeddedTurnstile(page, timeoutMs = 35000) {
   console.log('[TS] 开始处理表单内嵌 Turnstile...');
   const deadline = Date.now() + timeoutMs;
-  let clickAttempts = 0;
 
   while (Date.now() < deadline) {
     try {
-      const cfIframeLocator = page.locator(
+      // 定位 Turnstile iframe
+      const cfFrame = page.frameLocator(
         'iframe[src*="challenges.cloudflare"], iframe[src*="turnstile"]'
       ).first();
 
-      // 用 frameLocator 进入 iframe 内部检查状态
-      const cfIframe = page.frameLocator(
-        'iframe[src*="challenges.cloudflare"], iframe[src*="turnstile"]'
+      // 等待 iframe 内复选框出现（不同 Turnstile 版本的 class）
+      const checkbox = cfFrame.locator(
+        'input[type="checkbox"], .cb-o, #checkbox, label[for="checkbox"]'
       ).first();
 
-      // ── 检查是否已成功 ──────────────────────────────────────────
-      // Turnstile 成功后 #success 的 style 变为 display:grid
-      const successStyle = await cfIframe.locator('#success')
-        .getAttribute('style', { timeout: 1500 })
-        .catch(() => null);
-
-      if (successStyle && successStyle.includes('grid')) {
-        console.log('[TS] ✅ Turnstile 验证成功（#success 可见）');
-        return true;
-      }
-
-      // ── 检查是否在验证中（转圈）──────────────────────────────────
-      const verifyingStyle = await cfIframe.locator('#verifying')
-        .getAttribute('style', { timeout: 1500 })
-        .catch(() => null);
-
-      if (verifyingStyle && verifyingStyle.includes('grid')) {
-        console.log('[TS] Turnstile 验证中，等待结果...');
-        await sleep(2000);
+      if (await checkbox.count() === 0) {
+        // 可能已验证成功，检查是否存在 token 字段
+        const hasToken = await page.evaluate(() => {
+          const tokenInput = document.querySelector('input[name="cf-turnstile-response"]');
+          return tokenInput && tokenInput.value && tokenInput.value.length > 0;
+        });
+        if (hasToken) {
+          console.log('[TS] ✅ 检测到 Turnstile token 已存在，验证已通过');
+          return true;
+        }
+        await sleep(1000);
         continue;
       }
 
-      // ── 检查是否出现可点击的 checkbox ────────────────────────────
-      // 状态：display:flex 的 .cb-o 容器内有 checkbox label
-      const cbStyle = await cfIframe.locator('.cb-o, #AWWzG3')
-        .getAttribute('style', { timeout: 1500 })
-        .catch(() => null);
+      // 复选框可见 -> 尝试点击
+      await checkbox.waitFor({ state: 'visible', timeout: 5000 });
+      console.log('[TS] 发现 Turnstile 复选框，准备点击...');
 
-      const needsClick = cbStyle && (cbStyle.includes('flex') || cbStyle.includes('grid'));
-
-      if (needsClick && clickAttempts < 3) {
-        clickAttempts++;
-        console.log(`[TS] 检测到交互式 checkbox，第 ${clickAttempts} 次模拟点击...`);
-
-        // 获取 iframe 的屏幕坐标
-        const box = await cfIframeLocator.boundingBox().catch(() => null);
+      // 方法1：尝试用 locator.click()（Playwright 自动处理坐标）
+      try {
+        await checkbox.click({ timeout: 3000 });
+        console.log('[TS] 点击复选框成功 (click 方法)');
+      } catch (clickErr) {
+        // 方法2：如果常规 click 失败，获取坐标手动点击
+        console.log('[TS] 常规点击失败，尝试坐标点击...');
+        const box = await checkbox.boundingBox();
         if (box) {
-          // Turnstile checkbox 在 iframe 左侧约 1/6 处，垂直居中
-          const clickX = box.x + box.width * 0.12;
-          const clickY = box.y + box.height * 0.5;
-
-          // 模拟自然鼠标轨迹
-          await page.mouse.move(
-            clickX + 80 + Math.random() * 40,
-            clickY + 15 + Math.random() * 10,
-            { steps: 12 }
-          );
-          await sleep(150 + Math.random() * 200);
-          await page.mouse.move(clickX, clickY, { steps: 8 });
-          await sleep(80 + Math.random() * 120);
-          await page.mouse.click(clickX, clickY);
-
-          console.log('[TS] 已点击，等待 Turnstile 响应...');
-          await sleep(4000); // Turnstile 动画 + 验证需要时间
-          continue;
+          await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
+          await sleep(200);
+          await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+          console.log('[TS] 坐标点击完成');
+        } else {
+          // 方法3：最激进的方式，直接在 iframe 内 evaluate click
+          await cfFrame.evaluate(() => {
+            const cb = document.querySelector('input[type="checkbox"], .cb-o');
+            if (cb) cb.click();
+          });
+          console.log('[TS] JS evaluate 点击完成');
         }
       }
 
-      // ── 检查是否因失败需要重试 ───────────────────────────────────
-      const failStyle = await cfIframe.locator('#fail')
-        .getAttribute('style', { timeout: 1500 })
-        .catch(() => null);
+      // 点击后等待验证完成（轮询 token 字段）
+      console.log('[TS] 等待 Turnstile 验证结果...');
+      const tokenGenerated = await page.waitForFunction(
+        () => {
+          const token = document.querySelector('input[name="cf-turnstile-response"]');
+          return token && token.value && token.value.length > 0;
+        },
+        { timeout: 15000 }
+      ).then(() => true).catch(() => false);
 
-      if (failStyle && failStyle.includes('grid')) {
-        console.warn('[TS] Turnstile 验证失败，等待自动重置...');
-        clickAttempts = 0; // 重置点击计数，准备重试
-        await sleep(3000);
-        continue;
+      if (tokenGenerated) {
+        console.log('[TS] ✅ Turnstile 验证成功（token 已生成）');
+        return true;
+      } else {
+        console.warn('[TS] 点击后未生成 token，可能验证失败，将重试');
+        // 重置，稍后循环会再次尝试
+        await sleep(2000);
       }
 
     } catch (err) {
-      // iframe 可能还在加载，继续等
+      // iframe 可能还未加载，继续等待
+      if (err.message?.includes('Timeout')) {
+        console.log('[TS] 等待 iframe 或复选框超时，继续...');
+      } else {
+        console.warn('[TS] 处理异常:', err.message);
+      }
+      await sleep(1500);
     }
-
-    await sleep(1200);
   }
 
-  console.warn('[TS] ⚠️  Turnstile 处理超时');
+  console.warn('[TS] ⚠️ Turnstile 处理超时，未完成验证');
   return false;
 }
 
@@ -234,16 +231,10 @@ async function main() {
     await sleep(3000);
     await page.screenshot({ path: screenshot('01-initial-page'), fullPage: true });
 
-    // ── 2. 处理页面级 CF 拦截 ────────────────────────────────────────
-    const cfFrame = page.frames().find(f => f.url().includes('challenges.cloudflare'));
-    if (cfFrame) {
-      console.log('[2] 检测到 Cloudflare 页面拦截，等待自动验证...');
-      await waitForCloudflarePass(page, 30_000);
-      await sleep(2000);
-      await page.screenshot({ path: screenshot('02-after-cf'), fullPage: true });
-    } else {
-      console.log('[2] 未检测到 Cloudflare 页面拦截，直接进入登录页');
-    }
+    // ── 2. 处理页面级 Cloudflare 挑战（改进版）────────────────────────
+    console.log('[2] 处理可能的页面级 Cloudflare 拦截...');
+    await waitForChallengePass(page, 30000);
+    await page.screenshot({ path: screenshot('02-after-cf-challenge'), fullPage: true });
 
     // ── 3. 等待登录表单加载 ──────────────────────────────────────────
     console.log('[3] 等待登录表单...');
@@ -265,18 +256,18 @@ async function main() {
     await humanDelay(500, 1000);
     await page.screenshot({ path: screenshot('04-before-submit'), fullPage: true });
 
-    // ── 5. 处理表单内嵌 Turnstile（关键修复）────────────────────────
+    // ── 5. 处理表单内嵌 Turnstile（改进版）────────────────────────────
     const hasTurnstile = await page.locator(
       'iframe[src*="challenges.cloudflare"], iframe[src*="turnstile"]'
     ).count();
 
     if (hasTurnstile > 0) {
-      console.log('[5] 检测到表单内嵌 Turnstile，处理中...');
-      const tsSuccess = await handleEmbeddedTurnstile(page, 35_000);
+      console.log('[5] 检测到表单内嵌 Turnstile，开始处理...');
+      const tsSuccess = await handleEmbeddedTurnstile(page, 40000);
       if (tsSuccess) {
         console.log('[5] ✅ Turnstile 验证通过');
       } else {
-        console.warn('[5] ⚠️  Turnstile 可能未验证完成，仍尝试提交');
+        console.warn('[5] ⚠️ Turnstile 可能未完成，仍尝试提交');
       }
       await page.screenshot({ path: screenshot('05-after-turnstile'), fullPage: true });
     } else {
