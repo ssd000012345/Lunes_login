@@ -8,6 +8,8 @@
     "login": "node scripts/login.js"
   },
   "dependencies": {
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
     "@playwright/test": "^1.46.0"
   }
 }
