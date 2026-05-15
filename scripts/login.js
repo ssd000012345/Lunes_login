@@ -1,5 +1,5 @@
 // scripts/login.js
-// 自动登录 betadash.lunes.host，正确处理 Turnstile 验证流程
+// 终极版：处理 Cloudflare Turnstile（自适应查找复选框 + 精确坐标点击）
 
 import { chromium } from 'playwright-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
@@ -44,46 +44,21 @@ async function waitForChallengePass(page, timeoutMs = 30000) {
 }
 
 /**
- * 正确处理 Turnstile 的完整流程：
- * 1. 等待“正在验证...”状态结束（如果出现）
- * 2. 等待“请验证您是真人”或 checkbox 可见
- * 3. 点击 checkbox（通过多种方式）
- * 4. 等待 token 生成
+ * 改进版：在 Turnstile iframe 内查找复选框并点击
+ * 支持：角色查找、aria-label、通用元素、坐标点击
  */
 async function handleEmbeddedTurnstile(page, timeoutMs = 60000) {
-  console.log('[TS] 开始处理 Turnstile（完整流程版）...');
-  const startTime = Date.now();
+  console.log('[TS] 开始处理 Turnstile（终极版）...');
 
-  // 步骤1：如果出现“正在验证...”，等待它消失
+  // 1. 等待“Verify you are human”文本出现（确保 Turnstile 已就绪）
   try {
-    const verifyingText = page.locator('text=/正在验证|Verifying/i');
-    if (await verifyingText.count() > 0) {
-      console.log('[TS] 检测到“正在验证...”，等待验证初始化完成...');
-      await verifyingText.waitFor({ state: 'hidden', timeout: 15000 });
-      console.log('[TS] “正在验证...”已消失');
-    }
+    await page.waitForSelector('text=/Verify you are human|请验证您是真人/i', { timeout: 15000 });
+    console.log('[TS] ✅ 检测到验证提示文字');
   } catch (err) {
-    console.log('[TS] 未出现“正在验证...”或已快速通过');
+    console.warn('[TS] 未检测到提示文字，但继续尝试处理 iframe');
   }
 
-  // 步骤2：等待“请验证您是真人”或 checkbox 出现
-  console.log('[TS] 等待“请验证您是真人”或复选框出现...');
-  try {
-    await page.waitForSelector('text=/请验证您是真人|Verify you are human/i', { timeout: 15000 });
-    console.log('[TS] 检测到“请验证您是真人”提示');
-  } catch (err) {
-    console.warn('[TS] 未检测到提示文字，可能已验证完成，直接检查 token');
-    const hasToken = await page.evaluate(() => {
-      const token = document.querySelector('input[name="cf-turnstile-response"]');
-      return token && token.value && token.value.length > 0;
-    });
-    if (hasToken) {
-      console.log('[TS] 已存在 token，验证通过');
-      return true;
-    }
-  }
-
-  // 步骤3：定位 Turnstile iframe
+  // 2. 获取 Turnstile iframe
   let cfFrame = null;
   for (let attempt = 0; attempt < 5; attempt++) {
     const frames = page.frames();
@@ -102,85 +77,108 @@ async function handleEmbeddedTurnstile(page, timeoutMs = 60000) {
   }
   console.log(`[TS] 找到 Turnstile iframe: ${cfFrame.url()}`);
 
-  // 步骤4：等待 iframe 内的 checkbox 出现并可点击
-  let checkboxClicked = false;
-  for (let retry = 0; retry < 5 && !checkboxClicked; retry++) {
-    try {
-      // 在 iframe 内查找复选框并点击
-      const clicked = await cfFrame.evaluate(() => {
-        const selectors = [
-          'input[type="checkbox"]',
-          '.cb-o',
-          '#checkbox',
-          'label[for="checkbox"]',
-          'div[role="checkbox"]'
-        ];
-        for (const sel of selectors) {
-          const el = document.querySelector(sel);
-          if (el && el.offsetParent !== null) { // 可见
+  // 3. 等待 iframe 内部 body 加载完成
+  try {
+    await cfFrame.waitForSelector('body', { timeout: 10000 });
+    console.log('[TS] iframe 内容已加载');
+  } catch (err) {
+    console.warn('[TS] iframe body 未就绪，仍尝试操作');
+  }
+
+  // 4. 定义点击策略
+  let clicked = false;
+
+  // 策略1：通过 evaluate 查找复选框元素（不使用固定选择器，而是通过特征识别）
+  try {
+    const found = await cfFrame.evaluate(() => {
+      // 递归查找所有元素，寻找可能是复选框的元素
+      const allElements = document.querySelectorAll('*');
+      for (const el of allElements) {
+        const role = el.getAttribute('role');
+        const ariaLabel = el.getAttribute('aria-label');
+        const className = el.className;
+        const id = el.id;
+        // 匹配条件：role="checkbox" 或 aria-label 包含 checkbox/verify 或 class 包含 cb/checkbox
+        if (role === 'checkbox' ||
+            (ariaLabel && /checkbox|verify/i.test(ariaLabel)) ||
+            (className && /cb|checkbox|turnstile/i.test(className)) ||
+            (id && /checkbox/i.test(id))) {
+          // 确保元素可见且可点击
+          if (el.offsetParent !== null) {
             el.click();
             return true;
           }
         }
-        return false;
-      });
-
-      if (clicked) {
-        console.log('[TS] 通过 evaluate 点击复选框成功');
-        checkboxClicked = true;
-        break;
       }
-
-      // 备用：通过 Playwright locator 点击
-      const checkbox = cfFrame.locator('input[type="checkbox"], .cb-o').first();
-      if (await checkbox.count() > 0 && await checkbox.isVisible()) {
-        await checkbox.click({ timeout: 3000 });
-        console.log('[TS] 通过 locator 点击复选框成功');
-        checkboxClicked = true;
-        break;
-      }
-
-      console.log(`[TS] 第 ${retry+1} 次尝试未找到复选框，等待重试...`);
-      await sleep(1500);
-    } catch (err) {
-      console.log(`[TS] 点击尝试 ${retry+1} 失败: ${err.message}`);
-      await sleep(1000);
+      return false;
+    });
+    if (found) {
+      console.log('[TS] 策略1成功：通过元素特征点击复选框');
+      clicked = true;
+    } else {
+      console.log('[TS] 策略1未找到复选框');
     }
+  } catch (err) {
+    console.log(`[TS] 策略1失败: ${err.message}`);
   }
 
-  if (!checkboxClicked) {
-    console.error('[TS] 无法点击 Turnstile 复选框');
-    // 最后尝试坐标点击
+  // 策略2：使用精确坐标点击（推荐，成功率最高）
+  if (!clicked) {
+    console.log('[TS] 策略2：使用坐标点击');
     try {
       const frameElement = await cfFrame.frameElement();
       const box = await frameElement.boundingBox();
-      if (box) {
-        const clickX = box.x + box.width * 0.15;
+      if (box && box.width > 0 && box.height > 0) {
+        // Turnstile 复选框通常在 iframe 左侧 15%～20% 处，垂直居中
+        const clickX = box.x + box.width * 0.18;
         const clickY = box.y + box.height * 0.5;
+        console.log(`[TS] 坐标点击位置: (${clickX.toFixed(0)}, ${clickY.toFixed(0)})`);
+        // 模拟人类移动鼠标
+        await page.mouse.move(clickX - 30, clickY - 10, { steps: 5 });
+        await sleep(100 + Math.random() * 200);
+        await page.mouse.move(clickX, clickY, { steps: 8 });
+        await sleep(100 + Math.random() * 150);
         await page.mouse.click(clickX, clickY);
         console.log('[TS] 坐标点击完成');
-        checkboxClicked = true;
+        clicked = true;
+      } else {
+        console.warn('[TS] 无法获取 iframe 位置');
       }
-    } catch (e) {}
+    } catch (err) {
+      console.error(`[TS] 坐标点击失败: ${err.message}`);
+    }
   }
 
-  if (!checkboxClicked) return false;
+  if (!clicked) {
+    console.error('[TS] 所有点击方式均失败');
+    return false;
+  }
 
-  // 步骤5：等待 token 生成
+  // 5. 等待验证完成（token 生成）
   console.log('[TS] 等待 Turnstile 验证完成（token）...');
   const tokenGenerated = await page.waitForFunction(
     () => {
       const token = document.querySelector('input[name="cf-turnstile-response"]');
       return token && token.value && token.value.length > 0;
     },
-    { timeout: 15000, polling: 500 }
+    { timeout: 20000, polling: 500 }
   ).then(() => true).catch(() => false);
 
   if (tokenGenerated) {
     console.log('[TS] ✅ Turnstile token 已生成');
     return true;
   } else {
-    console.warn('[TS] 未检测到 token');
+    // 若 token 未生成，再额外等待 3 秒检查是否自动通过
+    await sleep(3000);
+    const hasToken = await page.evaluate(() => {
+      const token = document.querySelector('input[name="cf-turnstile-response"]');
+      return token && token.value && token.value.length > 0;
+    });
+    if (hasToken) {
+      console.log('[TS] ✅ Turnstile token 已生成（延迟）');
+      return true;
+    }
+    console.warn('[TS] 未检测到 token，验证可能失败');
     return false;
   }
 }
@@ -268,7 +266,7 @@ async function main() {
     await humanDelay(500, 1000);
     await page.screenshot({ path: screenshot('04-before-submit'), fullPage: true });
 
-    // 关键：处理 Turnstile
+    // 处理 Turnstile
     console.log('[5] 处理 Turnstile 验证...');
     const turnstileSuccess = await handleEmbeddedTurnstile(page, 60000);
     if (turnstileSuccess) {
@@ -294,7 +292,7 @@ async function main() {
     console.log('[6] 登录后 URL:', afterLoginUrl);
     await page.screenshot({ path: screenshot('06-after-login'), fullPage: true });
 
-    // 检查 Cloudflare 二次验证
+    // 检查是否被 Cloudflare 二次拦截
     const pageText = await page.content();
     if (pageText.includes('正在进行安全验证') || pageText.includes('Verifying') || pageText.includes('ray.id')) {
       console.error('[ERR] 登录触发了 Cloudflare 二次验证');
@@ -310,7 +308,7 @@ async function main() {
 
     console.log('[6] ✅ 登录成功！');
 
-    // 后续保活操作
+    // 保活后续流程
     console.log('[7] 前往 Dashboard');
     await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
     await sleep(1500);
