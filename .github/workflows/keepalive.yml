@@ -1,0 +1,212 @@
+name: Lunes Dashboard Keepalive
+
+on:
+  schedule:
+    # 每5天运行一次 (UTC时间 02:00)
+    # 使用每5天触发：1日, 6日, 11日, 16日, 21日, 26日, 31日
+    - cron: '0 2 1,6,11,16,21,26,31 * *'
+  workflow_dispatch: # 支持手动触发
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Playwright
+        run: |
+          npm init -y
+          npm install playwright @playwright/test
+          npx playwright install chromium --with-deps
+
+      - name: Login and visit server dashboard
+        env:
+          LUNES_EMAIL: ${{ secrets.LUNES_EMAIL }}
+          LUNES_PASSWORD: ${{ secrets.LUNES_PASSWORD }}
+          LUNES_SERVER_ID: ${{ secrets.LUNES_SERVER_ID }}
+        run: |
+          cat << 'EOF' > keepalive.js
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+
+          (async () => {
+            const browser = await chromium.launch({
+              headless: true,
+              args: ['--no-sandbox', '--disable-setuid-sandbox']
+            });
+
+            const context = await browser.newContext({
+              viewport: { width: 1280, height: 800 },
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            });
+
+            const page = await context.newPage();
+
+            try {
+              console.log('Step 1: Navigating to login page...');
+              await page.goto('https://betadash.lunes.host/login', {
+                waitUntil: 'networkidle',
+                timeout: 30000
+              });
+
+              console.log('Step 2: Filling login form...');
+              await page.fill('input[type="email"], input[name="email"], #email', process.env.LUNES_EMAIL);
+              await page.waitForTimeout(500);
+              await page.fill('input[type="password"], input[name="password"], #password', process.env.LUNES_PASSWORD);
+              await page.waitForTimeout(500);
+
+              console.log('Step 3: Completing Cloudflare Turnstile...');
+              // 等待 Cloudflare Turnstile 完成
+              await page.waitForTimeout(5000);
+
+              // 点击 Continue to dashboard 按钮
+              await page.click('button:has-text("Continue to dashboard"), input[type="submit"], button[type="submit"]');
+
+              console.log('Step 4: Waiting for dashboard...');
+              await page.waitForURL('**/betadash.lunes.host**', { timeout: 30000 });
+              await page.waitForTimeout(2000);
+
+              // 截图：主面板
+              await page.screenshot({
+                path: 'screenshot_dashboard.png',
+                fullPage: false
+              });
+              console.log('Dashboard screenshot saved.');
+
+              console.log('Step 5: Scrolling down to find server...');
+              await page.evaluate(() => window.scrollBy(0, 400));
+              await page.waitForTimeout(1000);
+
+              // 进入服务器页面
+              const serverId = process.env.LUNES_SERVER_ID;
+              const serverUrl = serverId
+                ? `https://betadash.lunes.host/servers/${serverId}`
+                : null;
+
+              if (serverUrl) {
+                console.log(`Step 6: Navigating to server page: ${serverUrl}`);
+                await page.goto(serverUrl, {
+                  waitUntil: 'networkidle',
+                  timeout: 30000
+                });
+              } else {
+                // 尝试点击服务器卡片
+                console.log('Step 6: Clicking on server card...');
+                const serverCard = await page.$('.server-card, [href*="/servers/"], a:has-text("trde")');
+                if (serverCard) {
+                  await serverCard.click();
+                  await page.waitForLoadState('networkidle');
+                } else {
+                  // 查找包含 trde 的链接
+                  await page.click('text=trde');
+                  await page.waitForLoadState('networkidle');
+                }
+              }
+
+              await page.waitForTimeout(2000);
+
+              console.log('Step 7: Checking for WARNING message...');
+              const warningText = await page.textContent('body');
+              if (warningText.includes('WARNING') || warningText.includes('FREE SERVERS WILL BE DELETED')) {
+                console.log('✅ WARNING message found - server is alive!');
+              } else {
+                console.log('⚠️  WARNING message not found on page.');
+              }
+
+              // 截图：服务器页面（包含 WARNING）
+              await page.screenshot({
+                path: 'screenshot_server.png',
+                fullPage: true
+              });
+              console.log('Server page screenshot saved.');
+
+              // 保存运行日志
+              const timestamp = new Date().toISOString();
+              const logEntry = `[${timestamp}] Login successful. Server page visited. WARNING banner present: ${warningText.includes('WARNING')}\n`;
+              fs.appendFileSync('keepalive.log', logEntry);
+              console.log('Log entry:', logEntry.trim());
+
+            } catch (err) {
+              console.error('Error during keepalive:', err.message);
+              await page.screenshot({ path: 'screenshot_error.png', fullPage: true });
+              process.exit(1);
+            } finally {
+              await browser.close();
+            }
+          })();
+          EOF
+          node keepalive.js
+
+      - name: Upload screenshots as artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: keepalive-screenshots-${{ github.run_number }}
+          path: |
+            screenshot_dashboard.png
+            screenshot_server.png
+            screenshot_error.png
+            keepalive.log
+          retention-days: 15
+          if-no-files-found: warn
+
+  # 清理旧的工作流运行记录，只保留最新2个
+  cleanup-old-runs:
+    runs-on: ubuntu-latest
+    needs: keepalive
+    if: always()
+    permissions:
+      actions: write
+
+    steps:
+      - name: Delete old workflow runs (keep latest 2)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const workflowId = context.workflow;
+
+            // 获取当前 workflow 的所有运行记录
+            const runs = await github.paginate(
+              github.rest.actions.listWorkflowRunsForRepo,
+              {
+                owner,
+                repo,
+                workflow_id: 'keepalive.yml',
+                per_page: 100,
+              }
+            );
+
+            console.log(`Total runs found: ${runs.length}`);
+
+            // 按创建时间排序（最新在前）
+            const sortedRuns = runs.sort(
+              (a, b) => new Date(b.created_at) - new Date(a.created_at)
+            );
+
+            // 删除第3个及以后的运行记录
+            const runsToDelete = sortedRuns.slice(2);
+            console.log(`Runs to delete: ${runsToDelete.length}`);
+
+            for (const run of runsToDelete) {
+              try {
+                await github.rest.actions.deleteWorkflowRun({
+                  owner,
+                  repo,
+                  run_id: run.id,
+                });
+                console.log(`Deleted run #${run.run_number} (ID: ${run.id})`);
+              } catch (err) {
+                console.log(`Failed to delete run #${run.run_number}: ${err.message}`);
+              }
+            }
+
+            console.log('Cleanup complete. Kept latest 2 runs.');
