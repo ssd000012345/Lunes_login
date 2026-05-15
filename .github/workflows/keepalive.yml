@@ -4,20 +4,17 @@ on:
   workflow_dispatch:   # 支持手动触发
   schedule:
     # 每 5 天执行一次，UTC 01:00（北京时间 09:00）
-    # cron 不支持"每N天"，用"每月1/6/11/16/21/26/31日"近似实现每5天
     - cron: "0 1 1,6,11,16,21,26 * *"
 
-# ── 仅保留最近 2 次工作流运行记录 ─────────────────────────────────────
 concurrency:
   group: keepalive
   cancel-in-progress: false
 
 jobs:
-  # ── 登录保活 job ─────────────────────────────────────────────────────
   keepalive:
     name: 登录 betadash.lunes.host 保活
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
 
     env:
       LUNES_EMAIL:    ${{ secrets.LUNES_EMAIL }}
@@ -51,13 +48,12 @@ jobs:
           name: keepalive-screenshots-${{ github.run_number }}
           path: "*.png"
           if-no-files-found: ignore
-          retention-days: 7   # 截图保留 7 天，节省存储
+          retention-days: 7
 
       - name: 若脚本失败则让 job 失败
         if: steps.login.outcome == 'failure'
         run: exit 1
 
-  # ── 清理旧 workflow runs，只保留最新 2 条 ─────────────────────────────
   cleanup:
     name: 清理旧工作流记录（保留 2 条）
     runs-on: ubuntu-latest
