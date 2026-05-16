@@ -1,14 +1,10 @@
 name: Betadash Keepalive（每 5 天自动登录）
 
 on:
-  workflow_dispatch:   # 支持手动触发
+  workflow_dispatch:
   schedule:
-    # 每 5 天执行一次，UTC 01:00（北京时间 09:00）
+    # 每月 1/6/11/16/21/26 日 UTC 01:00 ≈ 每 5 天
     - cron: "0 1 1,6,11,16,21,26 * *"
-
-concurrency:
-  group: keepalive
-  cancel-in-progress: false
 
 jobs:
   keepalive:
@@ -24,35 +20,40 @@ jobs:
       - name: Checkout 代码
         uses: actions/checkout@v4
 
-      - name: 安装 Node.js 20
-        uses: actions/setup-node@v4
+      - name: 安装 Python 3.12
+        uses: actions/setup-python@v5
         with:
-          node-version: 20
+          python-version: "3.12"
 
-      - name: 安装依赖 & Playwright Chromium
+      - name: 安装系统依赖（Chromium + Xvfb + 中文字体）
         run: |
-          npm ci || npm install
-          npx playwright install --with-deps chromium
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq chromium-browser xvfb fonts-noto-cjk
 
-      - name: 执行登录脚本
-        id: login
+      - name: 安装 Python 依赖
+        run: pip install -r requirements.txt
+
+      - name: 启动虚拟显示器并运行脚本
+        # headless=False + Xvfb：完全模拟真实桌面浏览器，绕过 CF 指纹检测
+        env:
+          DISPLAY: ":99"
         run: |
-          node -v && npm -v
-          npm run login
-        continue-on-error: true
+          export DISPLAY=:99
+          Xvfb :99 -screen 0 1366x768x24 +extension RANDR &
+          sleep 2
+          timeout 600 python scripts/login.py
+          EXIT_CODE=$?
+          echo "脚本退出码: $EXIT_CODE"
+          exit $EXIT_CODE
 
       - name: 上传截图（始终执行）
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: keepalive-screenshots-${{ github.run_number }}
-          path: "*.png"
+          path: screenshots/*.png
           if-no-files-found: ignore
           retention-days: 7
-
-      - name: 若脚本失败则让 job 失败
-        if: steps.login.outcome == 'failure'
-        run: exit 1
 
   cleanup:
     name: 清理旧工作流记录（保留 2 条）
