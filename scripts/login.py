@@ -13,12 +13,13 @@ from pydoll.browser.options import ChromiumOptions
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-EMAIL    = os.environ["LUNES_EMAIL"]
-PASSWORD = os.environ["LUNES_PASSWORD"]
+EMAIL     = os.environ["LUNES_EMAIL"]
+PASSWORD  = os.environ["LUNES_PASSWORD"]
+SERVER_ID = os.environ["LUNES_SERVER_ID"]   # 在仓库 Secrets 里配置，例如 75729
 
 BASE_URL   = "https://betadash.lunes.host"
 LOGIN_URL  = f"{BASE_URL}/login"
-SERVER_URL = f"{BASE_URL}/servers/75729"
+SERVER_URL = f"{BASE_URL}/servers/{SERVER_ID}"
 
 SHOT_DIR = Path("./screenshots")
 SHOT_DIR.mkdir(exist_ok=True)
@@ -85,7 +86,6 @@ async def create_browser():
     opts.browser_preferences = {
         "credentials_enable_service": False,
         "profile": {"password_manager_enabled": False},
-        "intl": {"accept_languages": "zh-CN,zh,en-US,en"},
     }
 
     browser = await Chrome(options=opts).__aenter__()
@@ -313,7 +313,7 @@ async def main():
 
         await take_screenshot(tab, "05-dashboard")
 
-        log.info("[5] 访问服务器 trde...")
+        log.info(f"[5] 访问服务器 {SERVER_ID}...")
         await ensure_cf_passed(tab, SERVER_URL)
         await asyncio.sleep(2)
 
@@ -323,7 +323,7 @@ async def main():
 
         if "FREE SERVERS WILL BE DELETED" in body:
             log.info("[5] ✅ WARNING 横幅已出现，保活成功！")
-        elif "trde" in body or "efbff607" in body:
+        elif SERVER_ID in url:
             log.info("[5] ✅ 服务器页面已加载，保活成功！")
         else:
             log.warning("[5] ⚠️  未确认服务器页面，请查看截图")
