@@ -39,7 +39,7 @@ jobs:
           DISPLAY: ":99"
         run: |
           export DISPLAY=:99
-          Xvfb :99 -screen 0 1366x768x24 +extension RANDR &
+          Xvfb :99 -screen 0 1366x900x24 +extension RANDR &
           sleep 2
           timeout 600 python scripts/login.py
           EXIT_CODE=$?
